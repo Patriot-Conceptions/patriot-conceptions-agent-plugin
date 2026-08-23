@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "patriot-conceptions": {
+      "type": "http",
+      "url": "https://gpt.patriotconceptions.com/mcp",
+      "headers": {
+        "X-PC-Client": "cursor-marketplace"
+      }
+    }
+  }
+}
