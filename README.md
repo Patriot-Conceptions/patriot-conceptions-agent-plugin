@@ -31,7 +31,7 @@ This package connects to the existing Patriot Conceptions MCP service at:
 
 `https://gpt.patriotconceptions.com/mcp`
 
-The package does not contain or fork the Patriot Conceptions application server. ChatGPT, Claude, Cursor, and Grok Bot use the same ten tool names, schemas, authorization boundaries, Profile Preview source, and published Atlas export. The portable `mcp.json` and compatibility `.mcp.json` describe the same endpoint and public attribution header; they do not define separate servers.
+The package does not contain or fork the Patriot Conceptions application server. ChatGPT, Claude, Cursor, and Grok Bot use the same ten tool names, schemas, authorization boundaries, Profile Preview source, and published Atlas export. The portable `plugin.json`, Cursor `.cursor-plugin/plugin.json`, `mcp.json`, and compatibility `.mcp.json` all describe one package and the same endpoint; they do not define separate servers.
 
 Hosts that support MCP App UI may render the Profile Preview and Atlas interface. Other hosts receive a complete text result with the same structured facts.
 

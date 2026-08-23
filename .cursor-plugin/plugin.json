@@ -1,0 +1,23 @@
+{
+  "name": "patriot-conceptions",
+  "displayName": "Patriot Conceptions",
+  "version": "1.0.0",
+  "description": "Explore authorized surrogate profile previews and published Surrogacy Atlas provider, state-planning, and cost information.",
+  "author": {
+    "name": "Patriot Conceptions",
+    "email": "info@patriotconceptions.com"
+  },
+  "logo": "./assets/logo.png",
+  "homepage": "https://patriotconceptions.com/help/chatgpt-and-claude/",
+  "repository": "https://github.com/Patriot-Conceptions/patriot-conceptions-agent-plugin",
+  "license": "MIT",
+  "keywords": [
+    "surrogacy",
+    "egg-donation",
+    "family-building",
+    "fertility-providers",
+    "intended-parents",
+    "mcp"
+  ],
+  "mcpServers": "./.mcp.json"
+}
