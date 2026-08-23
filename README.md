@@ -18,6 +18,13 @@ Install **Patriot Conceptions** from the Cursor Marketplace. The same marketplac
 
 For local validation in a compatible agent client, load this repository as an Agent Plugin. It contains one remote Streamable HTTP MCP connection and requires no API key.
 
+Validate the manifest and exercise all ten live tools without printing returned profile or provider records:
+
+```bash
+grok plugin validate .
+node scripts/smoke.mjs
+```
+
 ## How it works
 
 This package connects to the existing Patriot Conceptions MCP service at:
