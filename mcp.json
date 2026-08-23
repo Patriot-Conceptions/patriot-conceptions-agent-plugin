@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "patriot-conceptions": {
+      "type": "streamable-http",
+      "url": "https://gpt.patriotconceptions.com/mcp",
+      "headers": {
+        "X-PC-Client": "cursor-marketplace"
+      }
+    }
+  }
+}
