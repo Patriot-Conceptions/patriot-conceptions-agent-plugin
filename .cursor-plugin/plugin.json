@@ -7,7 +7,7 @@
     "name": "Patriot Conceptions",
     "email": "info@patriotconceptions.com"
   },
-  "logo": "./assets/logo.png",
+  "logo": "./assets/logo-square.png",
   "homepage": "https://patriotconceptions.com/help/chatgpt-and-claude/",
   "repository": "https://github.com/Patriot-Conceptions/patriot-conceptions-agent-plugin",
   "license": "MIT",
