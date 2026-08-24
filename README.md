@@ -25,6 +25,16 @@ grok plugin validate .
 node scripts/smoke.mjs
 ```
 
+### PC SSH skill
+
+The repository also publishes the `pc-ssh` Agent Skill for authorized Patriot Conceptions remote-server access through Zoho Vault and Tailscale. Install it globally for every locally detected compatible agent with the open Agent Skills CLI:
+
+```bash
+npx skills add Patriot-Conceptions/patriot-conceptions-agent-plugin --skill pc-ssh --global --agent '*' --yes
+```
+
+The operator must already have an authenticated, unlocked `zv` session. The skill retrieves and validates the selected SSH key in private temporary storage for each connection; it does not put private keys in the repository or agent configuration.
+
 ## How it works
 
 This package connects to the existing Patriot Conceptions MCP service at:

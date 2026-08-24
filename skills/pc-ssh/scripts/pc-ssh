@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  pc-ssh list [query]
+  pc-ssh check <server-name-or-host>
+  pc-ssh connect <server-name-or-host>
+  pc-ssh exec <server-name-or-host> -- <command> [args...]
+EOF
+}
+
+die() {
+  printf 'pc-ssh: %s\n' "$*" >&2
+  exit 1
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+for required in zv python3 ssh ssh-keygen; do
+  require_command "$required"
+done
+operator_home="${HOME:?HOME is required}"
+
+action="${1:-}"
+case "$action" in
+  list|check|connect|exec) shift ;;
+  -h|--help|'') usage; exit 0 ;;
+  *) usage; die "unknown action: $action" ;;
+esac
+
+query="${1:-Remote SSH}"
+if [[ "$action" != "list" && -z "${1:-}" ]]; then
+  usage
+  die "a server name or host is required"
+fi
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+if [[ "$action" == "exec" ]]; then
+  [[ "${1:-}" == "--" ]] || die "exec requires -- before the remote command"
+  shift
+  [[ $# -gt 0 ]] || die "exec requires a remote command"
+fi
+
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/pc-ssh.XXXXXX")"
+chmod 700 "$work_dir"
+lock_dir="${TMPDIR:-/tmp}/pc-ssh-zv-${UID}.lock"
+lock_held=0
+
+release_vault_lock() {
+  if [[ "$lock_held" -eq 1 ]]; then
+    unlink "$lock_dir/pid" 2>/dev/null || true
+    rmdir "$lock_dir" 2>/dev/null || true
+    lock_held=0
+  fi
+}
+
+cleanup() {
+  release_vault_lock
+  find "$work_dir" -type f -exec chmod 600 {} + 2>/dev/null || true
+  find "$work_dir" -type f -delete 2>/dev/null || true
+  find "$work_dir" -depth -type d -delete 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+acquire_vault_lock() {
+  local attempt=0
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    if [[ "$attempt" -ge 300 ]]; then
+      die "timed out waiting for another pc-ssh Vault retrieval"
+    fi
+    sleep 0.1
+  done
+  lock_held=1
+  printf '%s\n' "$$" >"$lock_dir/pid"
+}
+
+acquire_vault_lock
+
+search_file="$work_dir/search.json"
+if ! (cd "$operator_home" && zv search --key "Remote SSH" --name --output json) >"$search_file" 2>/dev/null; then
+  die "Zoho Vault search failed; run 'zv login --dc us' and 'zv unlock' interactively, then retry"
+fi
+[[ -s "$search_file" ]] || die "no Zoho Vault records named 'Remote SSH key' were found"
+
+candidate_file="$work_dir/candidates.tsv"
+python3 - "$search_file" >"$candidate_file" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+items = data.get("secrets", {}).get("secret", [])
+if isinstance(items, dict):
+    items = [items]
+for item in items:
+    secret_id = str(item.get("secretid", "")).strip()
+    name = str(item.get("secretname", "")).strip()
+    if secret_id and name:
+        print(f"{secret_id}\t{name}")
+PY
+
+[[ -s "$candidate_file" ]] || die "no Vault records matched: $query"
+
+metadata_file="$work_dir/metadata.tsv"
+while IFS=$'\t' read -r secret_id secret_name; do
+  detail_file="$work_dir/detail-$secret_id.json"
+  if (cd "$operator_home" && zv get -id "$secret_id" --output json) >"$detail_file" 2>/dev/null; then
+    python3 - "$detail_file" "$secret_id" "$secret_name" >>"$metadata_file" <<'PY'
+import json, sys
+from urllib.parse import urlparse
+with open(sys.argv[1], encoding="utf-8") as handle:
+    secret = json.load(handle).get("secret", {})
+url = str(secret.get("decryptedurls") or "").strip()
+parsed = urlparse(url)
+fields = secret.get("secretData") or []
+username = next((str(f.get("value", "")).strip() for f in fields if f.get("id") == "username"), "")
+attachment = next((str(f.get("value", "")).strip() for f in fields if f.get("type") == "file"), "")
+name = str(secret.get("decsecretname") or secret.get("secretname") or sys.argv[3]).strip()
+description = str(secret.get("decdescription") or "").strip()
+tags = str(secret.get("decryptedtags") or "").strip()
+host = parsed.hostname or ""
+url_user = parsed.username or ""
+if parsed.scheme == "ssh" and host and (username or url_user):
+    values = [sys.argv[2], name, url, username or url_user, host, attachment, description, tags]
+    print("\t".join(value.replace("\t", " ").replace("\n", " ") for value in values))
+PY
+  fi
+done <"$candidate_file"
+
+[[ -s "$metadata_file" ]] || die "matching Vault records lack valid ssh:// metadata"
+
+match_file="$work_dir/matches.tsv"
+python3 - "$metadata_file" "$query" >"$match_file" <<'PY'
+import sys
+query = sys.argv[2].casefold()
+rows = [line.rstrip("\n").split("\t") for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+matches = [row for row in rows if any(query in field.casefold() for field in row[1:])]
+if not matches and query == "remote ssh":
+    matches = rows
+for row in matches:
+    print("\t".join(row))
+PY
+
+if [[ "$action" == "list" ]]; then
+  [[ -s "$match_file" ]] || die "no SSH server records matched: $query"
+  python3 - "$match_file" <<'PY'
+import sys
+rows = [line.rstrip("\n").split("\t") for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+for row in rows:
+    _, name, url, user, host, *_ = row
+    print(f"{name}\n  {url}\n  user={user} host={host}")
+PY
+  release_vault_lock
+  exit 0
+fi
+
+match_count="$(wc -l <"$match_file" | tr -d ' ')"
+if [[ "$match_count" -eq 0 ]]; then
+  die "no SSH server record matched: $query"
+fi
+if [[ "$match_count" -ne 1 ]]; then
+  printf 'pc-ssh: multiple Vault records matched; use a more specific name or host:\n' >&2
+  cut -f2-3 "$match_file" | sed 's/^/  /' >&2
+  exit 2
+fi
+
+IFS=$'\t' read -r secret_id secret_name ssh_url ssh_user ssh_host attachment _ <"$match_file"
+[[ "$ssh_user" =~ ^[A-Za-z0-9._-]+$ ]] || die "Vault record has an unsafe SSH username"
+[[ "$ssh_host" =~ ^[A-Za-z0-9.-]+$ ]] || die "Vault record has an unsafe SSH hostname"
+[[ -n "$attachment" ]] || die "Vault record has no key attachment"
+
+download_dir="$work_dir/download"
+mkdir -m 700 "$download_dir"
+(cd "$operator_home" && zv download -id "$secret_id" --dir "$download_dir") >/dev/null 2>&1 || die "failed to download the Vault key attachment"
+release_vault_lock
+
+key_path="$download_dir/$attachment"
+if [[ ! -f "$key_path" || -L "$key_path" ]]; then
+  die "expected key attachment was not downloaded as a regular file"
+fi
+chmod 600 "$key_path"
+ssh-keygen -y -f "$key_path" >/dev/null 2>&1 || die "Vault attachment is not a valid SSH private key"
+
+ssh_options=(
+  -o IdentitiesOnly=yes
+  -o PreferredAuthentications=publickey
+  -o PasswordAuthentication=no
+  -o KbdInteractiveAuthentication=no
+  -i "$key_path"
+)
+destination="$ssh_user@$ssh_host"
+
+case "$action" in
+  check)
+    ssh "${ssh_options[@]}" -o BatchMode=yes -o ConnectTimeout=12 "$destination" 'whoami; hostname; pwd'
+    ;;
+  connect)
+    printf 'Connecting to %s (%s)\n' "$secret_name" "$destination" >&2
+    ssh "${ssh_options[@]}" "$destination"
+    ;;
+  exec)
+    ssh "${ssh_options[@]}" -o BatchMode=yes "$destination" -- "$@"
+    ;;
+esac

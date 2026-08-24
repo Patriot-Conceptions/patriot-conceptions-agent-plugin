@@ -1,0 +1,4 @@
+interface:
+  display_name: "PC SSH"
+  short_description: "Connect to PC remote Macs through Zoho Vault"
+  default_prompt: "Use $pc-ssh to connect to a Patriot Conceptions remote server using its Zoho Vault SSH key."
