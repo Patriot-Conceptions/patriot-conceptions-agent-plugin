@@ -35,6 +35,16 @@ npx skills add Patriot-Conceptions/patriot-conceptions-agent-plugin --skill pc-s
 
 The operator must already have an authenticated, unlocked `zv` session. The skill retrieves and validates the selected SSH key in private temporary storage for each connection; it does not put private keys in the repository or agent configuration.
 
+### Zoho One skill
+
+The repository also publishes the `zoho-one` Agent Skill for Patriot Conceptions Zoho One. It replaces the legacy `zoho-crm` skill (limited CRM-only scope) with a production OAuth client backed by GCP Secret Manager (`pc-application-portal`). Install it globally:
+
+```bash
+npx skills add Patriot-Conceptions/patriot-conceptions-agent-plugin --skill zoho-one --global --agent '*' --yes
+```
+
+`zoho-one` provides 13 token families (340 scopes) — CRM v8 (105 scopes), Books/Finance (17), Projects + Sprints (82), Desk + Creator (23), Mail + Calendar (18), Directory (12), People, WorkDrive, Vault, Analytics/DataPrep, and legacy portal fallback — via `zoho-one doctor / scopes / search / get / coql / get-url` and MCP `zoho_crm_rest`. The legacy `zoho-crm` CLI remains as a compatibility alias. Do not use `zohomcp.com` MCP proxies; this skill replaces all 13 of them. The `zohomcp.com` proxies have been removed from Hermes (`hermes mcp list` now shows only `zoho_crm_rest`).
+
 ## How it works
 
 This package connects to the existing Patriot Conceptions MCP service at:
