@@ -1,0 +1,4 @@
+interface:
+  display_name: "Travel VPN"
+  short_description: "Fast Cloudflare-accelerated relay to your office Mac while traveling"
+  default_prompt: "Use $travel-vpn to diagnose slow VPN/Tailscale exit-node speed while traveling and set up a fast Cloudflare-accelerated relay to an owned macOS host."

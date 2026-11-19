@@ -1,0 +1,900 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# travel-vpn: High-speed Cloudflare-accelerated travel relay (sing-box VLESS+WS+h2mux + cloudflared QUIC)
+# Turns any SSH-reachable macOS exit host behind NAT into a 15-25+ Mbps proxy from restricted networks.
+
+STATE_DIR="${TRAVEL_VPN_DIR:-$HOME/.travel-vpn}"
+CREDS_FILE="$STATE_DIR/creds.env"
+CLIENT_CFG="$STATE_DIR/client.json"
+SHELL_ENV="$STATE_DIR/shell.env"
+CLIENT_PLIST="$HOME/Library/LaunchAgents/ai.local.travel-vpn-client.plist"
+SINGBOX_BIN="${TRAVEL_VPN_SINGBOX:-$HOME/bin/sing-box}"
+SINGBOX_VERSION="${TRAVEL_VPN_SINGBOX_VERSION:-1.14.4}"
+PROXY_HOST="127.0.0.1"
+PROXY_PORT="${TRAVEL_VPN_PORT:-7890}"
+REMOTE_PORT="${TRAVEL_VPN_REMOTE_PORT:-18443}"
+PROXY_SERVICES=("Wi-Fi" "Tailscale")
+
+CF_CANDIDATES=(
+  "104.16.231.132"
+  "104.17.175.85"
+  "104.18.32.7"
+  "104.21.48.1"
+  "172.64.155.209"
+  "162.159.135.42"
+)
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  travel-vpn diagnose [--host <ssh-target> | --ssh-cmd '<cmd>']
+  travel-vpn bench-cf
+  travel-vpn setup-server (--host <ssh-target> | --ssh-cmd '<cmd>') [--port 18443] [--ipv4-only]
+  travel-vpn setup-client [--cf-ip auto|<ip>] [--port 7890] [--all-proxy]
+  travel-vpn on
+  travel-vpn off
+  travel-vpn status
+  travel-vpn speedtest
+  travel-vpn refresh
+  travel-vpn share-peer [--tailscale-peer <ip-or-name>] [--output <path>]
+  travel-vpn teardown-client
+  travel-vpn teardown-server (--host <ssh-target> | --ssh-cmd '<cmd>')
+
+Notes:
+  --host <ssh-target>   Standard SSH target (e.g. user@host or ~/.ssh/config alias).
+  --ssh-cmd '<cmd>'     Prefix command that runs a remote command (e.g. "pc-ssh exec my-mini --").
+EOF
+}
+
+die() {
+  printf 'travel-vpn: %s\n' "$*" >&2
+  exit 1
+}
+
+detect_wifi_dev() {
+  local dev
+  dev="$(networksetup -listallhardwareports 2>/dev/null | awk '/Hardware Port: Wi-Fi/{getline; print $2; exit}')"
+  printf '%s' "${dev:-en0}"
+}
+
+detect_arch() {
+  if [[ "$(uname -m)" == "arm64" ]]; then
+    printf 'arm64'
+  else
+    printf 'amd64'
+  fi
+}
+
+run_remote_stdin() {
+  local host="$1"
+  local ssh_cmd="$2"
+  if [[ -n "$ssh_cmd" ]]; then
+    # shellcheck disable=SC2086
+    $ssh_cmd bash -s
+  elif [[ -n "$host" ]]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=20 "$host" 'bash -s'
+  else
+    die "either --host or --ssh-cmd is required"
+  fi
+}
+
+parse_remote_args() {
+  REMOTE_HOST=""
+  REMOTE_SSH_CMD=""
+  IPV4_ONLY=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host) REMOTE_HOST="${2:-}"; shift 2 ;;
+      --ssh-cmd) REMOTE_SSH_CMD="${2:-}"; shift 2 ;;
+      --port) REMOTE_PORT="${2:-}"; shift 2 ;;
+      --ipv4-only) IPV4_ONLY=1; shift ;;
+      --allow-ipv6) IPV4_ONLY=0; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+}
+
+cmd_bench_cf() {
+  local wifi_dev best_ip="" best_score=0
+  wifi_dev="$(detect_wifi_dev)"
+  printf 'Benchmarking Cloudflare Anycast edge IPs over %s...\n' "$wifi_dev" >&2
+  for ip in "${CF_CANDIDATES[@]}"; do
+    local out code ttfb speed score mbps
+    out="$(curl --noproxy '*' --interface "$wifi_dev" --resolve "speed.cloudflare.com:443:${ip}" \
+      -o /dev/null -s --max-time 6 \
+      -w '%{http_code} %{time_starttransfer} %{speed_download}' \
+      'https://speed.cloudflare.com/__down?bytes=3000000' 2>/dev/null || true)"
+    read -r code ttfb speed mbps score < <(python3 - "$out" <<'PY'
+import sys
+parts = sys.argv[1].split()
+try:
+    code = int(parts[0]) if len(parts) > 0 else 0
+    ttfb = float(parts[1]) if len(parts) > 1 else 9.0
+    speed = float(parts[2]) if len(parts) > 2 else 0.0
+except ValueError:
+    code, ttfb, speed = 0, 9.0, 0.0
+score = int(speed) if code == 200 and speed > 200000 else 0
+print(f"{code} {ttfb:.3f} {speed:.0f} {speed*8/1e6:.2f} {score}")
+PY
+)
+    printf '  %-16s HTTP=%-3s ttfb=%ss speed=%s Mbps\n' "$ip" "$code" "$ttfb" "$mbps" >&2
+    if [[ "$score" -gt "$best_score" ]]; then
+      best_score="$score"
+      best_ip="$ip"
+    fi
+  done
+  if [[ -z "$best_ip" ]]; then
+    best_ip="${CF_CANDIDATES[0]}"
+    printf 'Warning: benchmark inconclusive; defaulting to %s\n' "$best_ip" >&2
+  fi
+  printf '%s\n' "$best_ip"
+}
+
+cmd_diagnose() {
+  parse_remote_args "$@"
+  local wifi_dev
+  wifi_dev="$(detect_wifi_dev)"
+
+  echo "=== Local Wi-Fi ($wifi_dev) -> Cloudflare Edge ==="
+  curl --noproxy '*' --interface "$wifi_dev" -s --max-time 6 https://speed.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc|colo)=' || true
+  curl --noproxy '*' --interface "$wifi_dev" -o /dev/null -s --max-time 10 \
+    -w 'Direct CF 5MB: %{speed_download} B/s (ttfb=%{time_starttransfer}s total=%{time_total}s)\n' \
+    'https://speed.cloudflare.com/__down?bytes=5000000' || true
+
+  echo "=== Current Default Route Speed ==="
+  curl -o /dev/null -s --max-time 10 \
+    -w 'Default 5MB:   %{speed_download} B/s (ttfb=%{time_starttransfer}s total=%{time_total}s)\n' \
+    'https://speed.cloudflare.com/__down?bytes=5000000' || true
+
+  if command -v tailscale >/dev/null 2>&1; then
+    echo "=== Tailscale Status ==="
+    tailscale status 2>/dev/null | head -n 15 || true
+  fi
+
+  if [[ -n "$REMOTE_HOST" || -n "$REMOTE_SSH_CMD" ]]; then
+    echo "=== Remote Host Check ==="
+    run_remote_stdin "$REMOTE_HOST" "$REMOTE_SSH_CMD" <<'REMOTE'
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+hostname; uptime
+pmset -g | grep -E 'sleep|autorestart|standby' || true
+curl -o /dev/null -s --max-time 10 -w 'Remote down 10MB: %{speed_download} B/s\n' 'https://speed.cloudflare.com/__down?bytes=10000000' || true
+dd if=/dev/zero bs=1m count=5 2>/dev/null | curl -s --max-time 10 -X POST --data-binary @- -o /dev/null -w 'Remote up 5MB:    %{speed_upload} B/s\n' 'https://speed.cloudflare.com/__up' || true
+REMOTE
+  fi
+}
+
+cmd_setup_server() {
+  parse_remote_args "$@"
+  [[ -n "$REMOTE_HOST" || -n "$REMOTE_SSH_CMD" ]] || die "setup-server requires --host or --ssh-cmd"
+
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+
+  local uuid wspath dns_strategy
+  uuid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  wspath="/ws-$(openssl rand -hex 6)"
+  dns_strategy="prefer_ipv4"
+  if [[ "$IPV4_ONLY" -eq 1 ]]; then
+    dns_strategy="ipv4_only"
+  fi
+
+  echo "==> Deploying sing-box + cloudflared QUIC tunnel on remote host..."
+  local tunnel_url
+  tunnel_url="$(run_remote_stdin "$REMOTE_HOST" "$REMOTE_SSH_CMD" <<REMOTE
+set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:\$PATH"
+
+if ! command -v brew >/dev/null 2>&1; then
+  echo "ERROR: Homebrew is required on the remote macOS host" >&2
+  exit 1
+fi
+if ! command -v sing-box >/dev/null 2>&1; then
+  HOMEBREW_NO_AUTO_UPDATE=1 brew install sing-box >&2
+fi
+if ! command -v cloudflared >/dev/null 2>&1; then
+  HOMEBREW_NO_AUTO_UPDATE=1 brew install cloudflared >&2
+fi
+
+SINGBOX="\$(command -v sing-box)"
+CLOUDFLARED="\$(command -v cloudflared)"
+mkdir -p "\$HOME/.travel-vpn" "\$HOME/Library/LaunchAgents"
+chmod 700 "\$HOME/.travel-vpn"
+
+cat > "\$HOME/.travel-vpn/server.json" <<'JSON'
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "local",
+        "type": "local"
+      }
+    ],
+    "strategy": "${dns_strategy}"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "127.0.0.1",
+      "listen_port": ${REMOTE_PORT},
+      "users": [
+        {
+          "uuid": "${uuid}"
+        }
+      ],
+      "multiplex": {
+        "enabled": true
+      },
+      "transport": {
+        "type": "ws",
+        "path": "${wspath}",
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": {
+      "server": "local",
+      "strategy": "${dns_strategy}"
+    }
+  }
+}
+JSON
+
+"\$SINGBOX" check -c "\$HOME/.travel-vpn/server.json" >&2
+
+cat > "\$HOME/Library/LaunchAgents/ai.local.travel-vpn-server.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.local.travel-vpn-server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>\${SINGBOX}</string>
+    <string>run</string>
+    <string>-c</string>
+    <string>\${HOME}/.travel-vpn/server.json</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>\${HOME}/.travel-vpn/server.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>\${HOME}/.travel-vpn/server.err.log</string>
+</dict>
+</plist>
+PLIST
+
+cat > "\$HOME/Library/LaunchAgents/ai.local.travel-vpn-tunnel.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.local.travel-vpn-tunnel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>\${CLOUDFLARED}</string>
+    <string>tunnel</string>
+    <string>--no-autoupdate</string>
+    <string>--config</string>
+    <string>/dev/null</string>
+    <string>--protocol</string>
+    <string>quic</string>
+    <string>--url</string>
+    <string>http://127.0.0.1:${REMOTE_PORT}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>\${HOME}/.travel-vpn/tunnel.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>\${HOME}/.travel-vpn/tunnel.err.log</string>
+</dict>
+</plist>
+PLIST
+
+rm -f "\$HOME/.travel-vpn/tunnel.err.log" "\$HOME/.travel-vpn/tunnel.out.log"
+launchctl bootout "gui/\$(id -u)" "\$HOME/Library/LaunchAgents/ai.local.travel-vpn-server.plist" 2>/dev/null || true
+launchctl bootout "gui/\$(id -u)" "\$HOME/Library/LaunchAgents/ai.local.travel-vpn-tunnel.plist" 2>/dev/null || true
+launchctl bootstrap "gui/\$(id -u)" "\$HOME/Library/LaunchAgents/ai.local.travel-vpn-server.plist"
+launchctl bootstrap "gui/\$(id -u)" "\$HOME/Library/LaunchAgents/ai.local.travel-vpn-tunnel.plist"
+
+URL=""
+for _ in \$(seq 1 25); do
+  if grep -q "Registered tunnel connection" "\$HOME/.travel-vpn/tunnel.err.log" 2>/dev/null; then
+    URL="\$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "\$HOME/.travel-vpn/tunnel.err.log" | tail -n 1)"
+    if [[ -n "\$URL" ]]; then
+      printf '%s\n' "\$URL" > "\$HOME/.travel-vpn/tunnel_url.txt"
+      break
+    fi
+  fi
+  sleep 1
+done
+
+if [[ -z "\$URL" ]]; then
+  echo "ERROR: cloudflared did not register a tunnel URL in time" >&2
+  tail -n 20 "\$HOME/.travel-vpn/tunnel.err.log" >&2 || true
+  exit 1
+fi
+
+SLEEP_VAL="\$(pmset -g 2>/dev/null | awk '/^[[:space:]]*sleep[[:space:]]/{print \$2; exit}')"
+if [[ -n "\$SLEEP_VAL" && "\$SLEEP_VAL" != "0" ]]; then
+  echo "WARNING: remote host sleep=\$SLEEP_VAL (recommend: sudo pmset -a sleep 0 autorestart 1)" >&2
+fi
+
+printf '%s\n' "\$URL"
+REMOTE
+)"
+
+  local tunnel_host="${tunnel_url#https://}"
+  [[ -n "$tunnel_host" ]] || die "failed to obtain tunnel hostname"
+
+  cat > "$CREDS_FILE" <<EOF
+TRAVEL_VPN_UUID=${uuid}
+TRAVEL_VPN_WSPATH=${wspath}
+TRAVEL_VPN_HOST=${tunnel_host}
+TRAVEL_VPN_REMOTE_HOST=${REMOTE_HOST}
+TRAVEL_VPN_REMOTE_SSH_CMD=${REMOTE_SSH_CMD}
+EOF
+  chmod 600 "$CREDS_FILE"
+  echo "Server ready. Credentials stored privately in $CREDS_FILE"
+}
+
+install_local_singbox() {
+  local wifi_dev="$1"
+  if [[ -x "$SINGBOX_BIN" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$SINGBOX_BIN")"
+  local arch url tmp_dir
+  arch="$(detect_arch)"
+  url="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-darwin-${arch}.tar.gz"
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/travel-vpn-sb.XXXXXX")"
+  trap 'rm -rf "$tmp_dir"' RETURN
+  echo "==> Downloading sing-box v${SINGBOX_VERSION} (${arch}) directly over ${wifi_dev}..."
+  curl --noproxy '*' --interface "$wifi_dev" -fSL --max-time 60 -o "$tmp_dir/sb.tar.gz" "$url" || \
+    curl -fSL --max-time 60 -o "$tmp_dir/sb.tar.gz" "$url"
+  tar -xzf "$tmp_dir/sb.tar.gz" -C "$tmp_dir"
+  mv "$tmp_dir/sing-box-${SINGBOX_VERSION}-darwin-${arch}/sing-box" "$SINGBOX_BIN"
+  chmod +x "$SINGBOX_BIN"
+}
+
+write_client_config() {
+  local wifi_dev="$1"
+  local cf_ip="$2"
+  local split_cn="$3"
+  local cn_rules=""
+  if [[ "$split_cn" -eq 1 ]]; then
+    cn_rules='      {
+        "domain_suffix": [
+          "cn", "local", "ts.net",
+          "qq.com", "wechat.com", "weixin.com",
+          "alipay.com", "alipayobjects.com",
+          "taobao.com", "tmall.com", "alicdn.com", "aliyun.com", "aliyuncs.com",
+          "jd.com", "baidu.com", "bdstatic.com",
+          "bilibili.com", "hdslb.com", "zhihu.com",
+          "meituan.com", "dianping.com", "amap.com",
+          "126.com", "163.com", "douyin.com", "bytedance.com",
+          "xiaohongshu.com", "xhscdn.com", "dingtalk.com", "feishu.cn",
+          "ctrip.com", "trip.com", "12306.cn", "cmbchina.com", "icbc.com.cn"
+        ],
+        "outbound": "direct"
+      },'
+  fi
+
+  cat > "$CLIENT_CFG" <<JSON
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "cn-dns",
+        "type": "udp",
+        "server": "223.5.5.5",
+        "detour": "direct"
+      }
+    ],
+    "final": "cn-dns"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "${PROXY_HOST}",
+      "listen_port": ${PROXY_PORT}
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "auto-proxy",
+      "outbounds": [
+        "cf-proxy",
+        "ts-fallback"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "1m",
+      "tolerance": 500,
+      "interrupt_exist_connections": false
+    },
+    {
+      "type": "vless",
+      "tag": "cf-proxy",
+      "server": "${cf_ip}",
+      "server_port": 443,
+      "uuid": "${TRAVEL_VPN_UUID}",
+      "bind_interface": "${wifi_dev}",
+      "tls": {
+        "enabled": true,
+        "server_name": "${TRAVEL_VPN_HOST}",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "transport": {
+        "type": "ws",
+        "path": "${TRAVEL_VPN_WSPATH}",
+        "headers": {
+          "Host": "${TRAVEL_VPN_HOST}"
+        },
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      },
+      "multiplex": {
+        "enabled": true,
+        "protocol": "h2mux",
+        "max_connections": 4,
+        "min_streams": 4
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "ts-fallback"
+    },
+    {
+      "type": "direct",
+      "tag": "direct",
+      "bind_interface": "${wifi_dev}"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": "cn-dns",
+    "rules": [
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "100.64.0.0/10"
+        ],
+        "outbound": "direct"
+      },
+${cn_rules}
+      {
+        "domain_suffix": [
+          "local",
+          "ts.net"
+        ],
+        "outbound": "direct"
+      }
+    ],
+    "final": "auto-proxy"
+  }
+}
+JSON
+  chmod 600 "$CLIENT_CFG"
+  "$SINGBOX_BIN" check -c "$CLIENT_CFG"
+}
+
+cmd_setup_client() {
+  local cf_ip="auto"
+  local split_cn=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cf-ip) cf_ip="${2:-auto}"; shift 2 ;;
+      --port) PROXY_PORT="${2:-7890}"; shift 2 ;;
+      --all-proxy) split_cn=0; shift ;;
+      --split-cn) split_cn=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  [[ -f "$CREDS_FILE" ]] || die "missing $CREDS_FILE — run 'travel-vpn setup-server' first"
+  # shellcheck disable=SC1090
+  source "$CREDS_FILE"
+
+  local wifi_dev
+  wifi_dev="$(detect_wifi_dev)"
+  install_local_singbox "$wifi_dev"
+
+  if [[ "$cf_ip" == "auto" ]]; then
+    cf_ip="$(cmd_bench_cf)"
+  fi
+
+  # Persist chosen CF IP in creds.env
+  grep -v '^TRAVEL_VPN_CF_IP=' "$CREDS_FILE" > "${CREDS_FILE}.tmp" || true
+  printf 'TRAVEL_VPN_CF_IP=%s\n' "$cf_ip" >> "${CREDS_FILE}.tmp"
+  mv "${CREDS_FILE}.tmp" "$CREDS_FILE"
+  chmod 600 "$CREDS_FILE"
+
+  write_client_config "$wifi_dev" "$cf_ip" "$split_cn"
+
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$CLIENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.local.travel-vpn-client</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${SINGBOX_BIN}</string>
+    <string>run</string>
+    <string>-c</string>
+    <string>${CLIENT_CFG}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${STATE_DIR}/client.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>${STATE_DIR}/client.err.log</string>
+</dict>
+</plist>
+PLIST
+
+  if ! grep -q '# travel-vpn' "$HOME/.zshrc" 2>/dev/null; then
+    cat >> "$HOME/.zshrc" <<'ZSH'
+
+# travel-vpn
+export PATH="$HOME/bin:$PATH"
+[ -f "$HOME/.travel-vpn/shell.env" ] && source "$HOME/.travel-vpn/shell.env"
+ZSH
+  fi
+
+  launchctl bootout "gui/$(id -u)" "$CLIENT_PLIST" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$CLIENT_PLIST"
+  sleep 1
+  cmd_on
+  cmd_status
+  cmd_speedtest
+}
+
+ensure_client_running() {
+  if ! pgrep -f "$SINGBOX_BIN run -c $CLIENT_CFG" >/dev/null 2>&1; then
+    [[ -f "$CLIENT_PLIST" ]] || die "client not installed; run 'travel-vpn setup-client' first"
+    launchctl bootout "gui/$(id -u)" "$CLIENT_PLIST" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$CLIENT_PLIST"
+    sleep 1
+  fi
+}
+
+cmd_on() {
+  ensure_client_running
+  for svc in "${PROXY_SERVICES[@]}"; do
+    if networksetup -getwebproxy "$svc" >/dev/null 2>&1; then
+      networksetup -setwebproxy "$svc" "$PROXY_HOST" "$PROXY_PORT"
+      networksetup -setsecurewebproxy "$svc" "$PROXY_HOST" "$PROXY_PORT"
+      networksetup -setsocksfirewallproxy "$svc" "$PROXY_HOST" "$PROXY_PORT"
+      networksetup -setwebproxystate "$svc" on
+      networksetup -setsecurewebproxystate "$svc" on
+      networksetup -setsocksfirewallproxystate "$svc" on
+      networksetup -setproxybypassdomains "$svc" \
+        localhost 127.0.0.1 ::1 "*.local" "169.254/16" \
+        "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "100.64.0.0/10" \
+        "*.ts.net"
+    fi
+  done
+
+  mkdir -p "$STATE_DIR"
+  cat > "$SHELL_ENV" <<EOF
+export http_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+export https_proxy="http://${PROXY_HOST}:${PROXY_PORT}"
+export HTTP_PROXY="http://${PROXY_HOST}:${PROXY_PORT}"
+export HTTPS_PROXY="http://${PROXY_HOST}:${PROXY_PORT}"
+export all_proxy="socks5h://${PROXY_HOST}:${PROXY_PORT}"
+export ALL_PROXY="socks5h://${PROXY_HOST}:${PROXY_PORT}"
+export no_proxy="localhost,127.0.0.1,::1,.local,.ts.net,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10"
+export NO_PROXY="\$no_proxy"
+EOF
+  echo "travel-vpn ON (macOS Wi-Fi + Tailscale proxy + shell env -> ${PROXY_HOST}:${PROXY_PORT})"
+}
+
+cmd_off() {
+  for svc in "${PROXY_SERVICES[@]}"; do
+    if networksetup -getwebproxy "$svc" >/dev/null 2>&1; then
+      networksetup -setwebproxystate "$svc" off
+      networksetup -setsecurewebproxystate "$svc" off
+      networksetup -setsocksfirewallproxystate "$svc" off
+    fi
+  done
+  rm -f "$SHELL_ENV"
+  launchctl bootout "gui/$(id -u)" "$CLIENT_PLIST" 2>/dev/null || true
+  echo "travel-vpn OFF (macOS proxies disabled, client stopped)"
+}
+
+cmd_status() {
+  echo "=== Client ==="
+  pgrep -fl "sing-box run -c $CLIENT_CFG" || echo "not running"
+  echo "=== Active macOS Proxy (scutil --proxy) ==="
+  scutil --proxy | grep -E "HTTPEnable|HTTPProxy|HTTPPort|HTTPSEnable|SOCKSEnable" || true
+  echo "=== Exit IP & Latency ==="
+  curl -x "http://${PROXY_HOST}:${PROXY_PORT}" -s --max-time 8 https://ipinfo.io/json | grep -E '"ip"|"city"|"region"|"country"' || echo "proxy unreachable"
+  curl -x "http://${PROXY_HOST}:${PROXY_PORT}" -o /dev/null -s --max-time 8 -w "google.com: HTTP %{http_code} in %{time_starttransfer}s\n" https://www.google.com || true
+}
+
+cmd_speedtest() {
+  curl -x "http://${PROXY_HOST}:${PROXY_PORT}" -o /dev/null -s --max-time 20 \
+    -w "10MB download: %{speed_download} B/s (total %{time_total}s)\n" \
+    "https://speed.cloudflare.com/__down?bytes=10000000" | awk '{
+      if (match($0, /[0-9]+(\.[0-9]+)? B\/s/)) {
+        bps = substr($0, RSTART, RLENGTH-4) + 0
+        printf "10MB download: %.2f Mbps (%.2f MB/s) %s\n", bps*8/1e6, bps/1e6, substr($0, RSTART+RLENGTH)
+      } else print
+    }'
+}
+
+cmd_refresh() {
+  [[ -f "$CREDS_FILE" ]] || die "missing $CREDS_FILE"
+  # shellcheck disable=SC1090
+  source "$CREDS_FILE"
+  local new_url new_host
+  new_url="$(run_remote_stdin "${TRAVEL_VPN_REMOTE_HOST:-}" "${TRAVEL_VPN_REMOTE_SSH_CMD:-}" <<'REMOTE'
+grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$HOME/.travel-vpn/tunnel.err.log" 2>/dev/null | tail -n 1 || cat "$HOME/.travel-vpn/tunnel_url.txt"
+REMOTE
+)"
+  new_url="$(printf '%s' "$new_url" | tr -d '\r\n')"
+  [[ -n "$new_url" ]] || die "could not fetch tunnel URL from remote host"
+  new_host="${new_url#https://}"
+
+  python3 - "$CLIENT_CFG" "$new_host" <<'PY'
+import json, sys
+path, host = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    cfg = json.load(f)
+for ob in cfg.get("outbounds", []):
+    if ob.get("type") == "vless":
+        ob["tls"]["server_name"] = host
+        ob["transport"]["headers"]["Host"] = host
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+PY
+  grep -v '^TRAVEL_VPN_HOST=' "$CREDS_FILE" > "${CREDS_FILE}.tmp" || true
+  printf 'TRAVEL_VPN_HOST=%s\n' "$new_host" >> "${CREDS_FILE}.tmp"
+  mv "${CREDS_FILE}.tmp" "$CREDS_FILE"
+  chmod 600 "$CREDS_FILE"
+
+  "$SINGBOX_BIN" check -c "$CLIENT_CFG"
+  launchctl kickstart -k "gui/$(id -u)/ai.local.travel-vpn-client" 2>/dev/null || ensure_client_running
+  echo "Refreshed tunnel endpoint and restarted local client."
+}
+
+cmd_share_peer() {
+  local tailscale_peer="" out_file="$STATE_DIR/install-peer.sh"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tailscale-peer) tailscale_peer="${2:-}"; shift 2 ;;
+      --output) out_file="${2:-}"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -f "$CREDS_FILE" ]] || die "missing $CREDS_FILE — run setup-server and setup-client first"
+  # shellcheck disable=SC1090
+  source "$CREDS_FILE"
+  local cf_ip="${TRAVEL_VPN_CF_IP:-${CF_CANDIDATES[0]}}"
+
+  cat > "$out_file" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+UUID="${TRAVEL_VPN_UUID}"
+WSPATH="${TRAVEL_VPN_WSPATH}"
+TUNNEL_HOST="${TRAVEL_VPN_HOST}"
+CF_IP="${cf_ip}"
+SB_VER="${SINGBOX_VERSION}"
+PROXY_PORT="${PROXY_PORT}"
+
+ARCH="amd64"
+[[ "\$(uname -m)" == "arm64" ]] && ARCH="arm64"
+WIFI_DEV="\$(networksetup -listallhardwareports | awk '/Hardware Port: Wi-Fi/{getline; print \$2; exit}')"
+WIFI_DEV="\${WIFI_DEV:-en0}"
+
+mkdir -p "\$HOME/bin" "\$HOME/.travel-vpn" "\$HOME/Library/LaunchAgents"
+chmod 700 "\$HOME/.travel-vpn"
+
+if [[ ! -x "\$HOME/bin/sing-box" ]]; then
+  echo "==> Downloading sing-box v\${SB_VER} (\${ARCH}) over \${WIFI_DEV}..."
+  URL="https://github.com/SagerNet/sing-box/releases/download/v\${SB_VER}/sing-box-\${SB_VER}-darwin-\${ARCH}.tar.gz"
+  curl --noproxy '*' --interface "\$WIFI_DEV" -fSL --max-time 60 -o /tmp/sb.tar.gz "\$URL" || curl -fSL --max-time 60 -o /tmp/sb.tar.gz "\$URL"
+  tar -xzf /tmp/sb.tar.gz -C /tmp
+  mv "/tmp/sing-box-\${SB_VER}-darwin-\${ARCH}/sing-box" "\$HOME/bin/sing-box"
+  chmod +x "\$HOME/bin/sing-box"
+  rm -rf /tmp/sb.tar.gz "/tmp/sing-box-\${SB_VER}-darwin-\${ARCH}"
+fi
+
+cat > "\$HOME/.travel-vpn/client.json" <<JSON
+{
+  "log": { "level": "warn", "timestamp": true },
+  "dns": {
+    "servers": [{ "tag": "cn-dns", "type": "udp", "server": "223.5.5.5", "detour": "direct" }],
+    "final": "cn-dns"
+  },
+  "inbounds": [{ "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": \${PROXY_PORT} }],
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "auto-proxy",
+      "outbounds": ["cf-proxy", "ts-fallback"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "1m",
+      "tolerance": 500,
+      "interrupt_exist_connections": false
+    },
+    {
+      "type": "vless",
+      "tag": "cf-proxy",
+      "server": "\${CF_IP}",
+      "server_port": 443,
+      "uuid": "\${UUID}",
+      "bind_interface": "\${WIFI_DEV}",
+      "tls": { "enabled": true, "server_name": "\${TUNNEL_HOST}", "utls": { "enabled": true, "fingerprint": "chrome" } },
+      "transport": {
+        "type": "ws",
+        "path": "\${WSPATH}",
+        "headers": { "Host": "\${TUNNEL_HOST}" },
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      },
+      "multiplex": { "enabled": true, "protocol": "h2mux", "max_connections": 4, "min_streams": 4 }
+    },
+    { "type": "direct", "tag": "ts-fallback" },
+    { "type": "direct", "tag": "direct", "bind_interface": "\${WIFI_DEV}" }
+  ],
+  "route": {
+    "default_domain_resolver": "cn-dns",
+    "rules": [
+      { "ip_is_private": true, "outbound": "direct" },
+      { "ip_cidr": ["100.64.0.0/10"], "outbound": "direct" },
+      {
+        "domain_suffix": [
+          "cn", "local", "ts.net", "qq.com", "wechat.com", "weixin.com",
+          "alipay.com", "alipayobjects.com", "taobao.com", "tmall.com", "alicdn.com",
+          "aliyun.com", "aliyuncs.com", "jd.com", "baidu.com", "bdstatic.com",
+          "bilibili.com", "hdslb.com", "zhihu.com", "meituan.com", "dianping.com",
+          "amap.com", "126.com", "163.com", "douyin.com", "bytedance.com",
+          "xiaohongshu.com", "xhscdn.com", "dingtalk.com", "feishu.cn",
+          "ctrip.com", "trip.com", "12306.cn", "cmbchina.com", "icbc.com.cn"
+        ],
+        "outbound": "direct"
+      }
+    ],
+    "final": "auto-proxy"
+  }
+}
+JSON
+chmod 600 "\$HOME/.travel-vpn/client.json"
+"\$HOME/bin/sing-box" check -c "\$HOME/.travel-vpn/client.json"
+
+cat > "\$HOME/Library/LaunchAgents/ai.local.travel-vpn-client.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.local.travel-vpn-client</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>\${HOME}/bin/sing-box</string>
+    <string>run</string>
+    <string>-c</string>
+    <string>\${HOME}/.travel-vpn/client.json</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>\${HOME}/.travel-vpn/client.out.log</string>
+  <key>StandardErrorPath</key><string>\${HOME}/.travel-vpn/client.err.log</string>
+</dict>
+</plist>
+PLIST
+
+launchctl bootout "gui/\$(id -u)" "\$HOME/Library/LaunchAgents/ai.local.travel-vpn-client.plist" 2>/dev/null || true
+launchctl bootstrap "gui/\$(id -u)" "\$HOME/Library/LaunchAgents/ai.local.travel-vpn-client.plist"
+sleep 1
+
+for svc in "Wi-Fi" "Tailscale"; do
+  if networksetup -getwebproxy "\$svc" >/dev/null 2>&1; then
+    networksetup -setwebproxy "\$svc" 127.0.0.1 "\${PROXY_PORT}"
+    networksetup -setsecurewebproxy "\$svc" 127.0.0.1 "\${PROXY_PORT}"
+    networksetup -setsocksfirewallproxy "\$svc" 127.0.0.1 "\${PROXY_PORT}"
+    networksetup -setwebproxystate "\$svc" on
+    networksetup -setsecurewebproxystate "\$svc" on
+    networksetup -setsocksfirewallproxystate "\$svc" on
+    networksetup -setproxybypassdomains "\$svc" localhost 127.0.0.1 ::1 "*.local" "169.254/16" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "100.64.0.0/10" "*.ts.net"
+  fi
+done
+
+echo "==> Verifying exit IP and speed..."
+curl -x "http://127.0.0.1:\${PROXY_PORT}" -s --max-time 8 https://ipinfo.io/json | grep -E '"ip"|"city"|"region"|"country"' || true
+curl -x "http://127.0.0.1:\${PROXY_PORT}" -o /dev/null -s --max-time 20 -w "10MB download: %{speed_download} B/s (total %{time_total}s)\n" "https://speed.cloudflare.com/__down?bytes=10000000"
+echo "==> Done! travel-vpn is active on this Mac."
+EOF
+  chmod 600 "$out_file"
+  bash -n "$out_file"
+  echo "Generated peer installer at $out_file (mode 600 — delete after use)."
+
+  if [[ -n "$tailscale_peer" ]]; then
+    command -v tailscale >/dev/null 2>&1 || die "tailscale CLI not found"
+    echo "==> Sending installer to $tailscale_peer via Taildrop..."
+    tailscale file cp "$out_file" "${tailscale_peer}:"
+    echo "Delivered via Taildrop. On the peer Mac, run: bash ~/Downloads/$(basename "$out_file")"
+  fi
+}
+
+cmd_teardown_client() {
+  cmd_off
+  rm -f "$CLIENT_PLIST"
+  rm -rf "$STATE_DIR"
+  echo "Removed local travel-vpn client LaunchAgent and $STATE_DIR."
+  echo "Note: remove the '# travel-vpn' block from ~/.zshrc if no longer needed."
+}
+
+cmd_teardown_server() {
+  parse_remote_args "$@"
+  [[ -n "$REMOTE_HOST" || -n "$REMOTE_SSH_CMD" ]] || die "teardown-server requires --host or --ssh-cmd"
+  run_remote_stdin "$REMOTE_HOST" "$REMOTE_SSH_CMD" <<'REMOTE'
+set -euo pipefail
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/ai.local.travel-vpn-tunnel.plist" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/ai.local.travel-vpn-server.plist" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/ai.local.travel-vpn-tunnel.plist" \
+      "$HOME/Library/LaunchAgents/ai.local.travel-vpn-server.plist"
+rm -rf "$HOME/.travel-vpn"
+echo "Remote travel-vpn server and tunnel removed."
+REMOTE
+}
+
+action="${1:-}"
+case "$action" in
+  diagnose) shift; cmd_diagnose "$@" ;;
+  bench-cf) shift; cmd_bench_cf "$@" ;;
+  setup-server) shift; cmd_setup_server "$@" ;;
+  setup-client) shift; cmd_setup_client "$@" ;;
+  on) shift; cmd_on "$@" ;;
+  off) shift; cmd_off "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  speedtest) shift; cmd_speedtest "$@" ;;
+  refresh) shift; cmd_refresh "$@" ;;
+  share-peer) shift; cmd_share_peer "$@" ;;
+  teardown-client) shift; cmd_teardown_client "$@" ;;
+  teardown-server) shift; cmd_teardown_server "$@" ;;
+  -h|--help|'') usage; exit 0 ;;
+  *) usage; die "unknown action: $action" ;;
+esac

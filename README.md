@@ -35,6 +35,16 @@ npx skills add Patriot-Conceptions/patriot-conceptions-agent-plugin --skill pc-s
 
 The operator must already have an authenticated, unlocked `zv` session. The skill retrieves and validates the selected SSH key in private temporary storage for each connection; it does not put private keys in the repository or agent configuration.
 
+### Travel VPN skill
+
+The repository also publishes the `travel-vpn` Agent Skill for setting up a fast Cloudflare-accelerated travel relay (`sing-box` VLESS + WebSocket + `h2mux` over a QUIC `cloudflared` tunnel) to an owned macOS exit host behind NAT when commercial VPNs or Tailscale DERP relays are slow. Install it globally with:
+
+```bash
+npx skills add Patriot-Conceptions/patriot-conceptions-agent-plugin --skill travel-vpn --global --agent '*' --yes
+```
+
+Credentials are generated per deployment and stored locally in mode-`600` state files (`~/.travel-vpn/`); nothing sensitive is stored in this repository.
+
 ## How it works
 
 This package connects to the existing Patriot Conceptions MCP service at:
