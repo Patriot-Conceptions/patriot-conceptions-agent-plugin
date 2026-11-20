@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# travel-vpn: High-speed Cloudflare-accelerated travel relay (sing-box VLESS+WS+h2mux + cloudflared QUIC)
-# Turns any SSH-reachable macOS exit host behind NAT into a 15-25+ Mbps proxy from restricted networks.
+# travel-vpn: High-speed Cloudflare-accelerated travel relay (sing-box VLESS+WS+smux + cloudflared QUIC)
+# Turns any SSH-reachable macOS exit host behind NAT into a 15-30+ Mbps proxy from restricted networks.
 
 STATE_DIR="${TRAVEL_VPN_DIR:-$HOME/.travel-vpn}"
 CREDS_FILE="$STATE_DIR/creds.env"
@@ -17,11 +17,13 @@ REMOTE_PORT="${TRAVEL_VPN_REMOTE_PORT:-18443}"
 PROXY_SERVICES=("Wi-Fi" "Tailscale")
 
 CF_CANDIDATES=(
-  "104.16.231.132"
-  "104.17.175.85"
-  "104.18.32.7"
-  "104.21.48.1"
+  "108.162.198.50"
+  "108.162.198.1"
+  "162.159.136.42"
+  "172.67.70.10"
   "172.64.155.209"
+  "104.18.32.7"
+  "104.19.45.10"
   "162.159.135.42"
 )
 
@@ -97,39 +99,53 @@ parse_remote_args() {
 }
 
 cmd_bench_cf() {
-  local wifi_dev best_ip="" best_score=0
+  local top_n=1
+  if [[ "${1:-}" == "--top" ]]; then
+    top_n="${2:-4}"
+    shift 2
+  fi
+  local wifi_dev
   wifi_dev="$(detect_wifi_dev)"
   printf 'Benchmarking Cloudflare Anycast edge IPs over %s...\n' "$wifi_dev" >&2
+
+  local results=""
   for ip in "${CF_CANDIDATES[@]}"; do
-    local out code ttfb speed score mbps
+    local colo out code conn ttfb speed score mbps
+    colo="$(curl --noproxy '*' --interface "$wifi_dev" --resolve "speed.cloudflare.com:443:${ip}" \
+      -s --max-time 3 'https://speed.cloudflare.com/cdn-cgi/trace' 2>/dev/null | awk -F= '/^colo=/{print $2; exit}')"
+    colo="${colo:-?}"
     out="$(curl --noproxy '*' --interface "$wifi_dev" --resolve "speed.cloudflare.com:443:${ip}" \
       -o /dev/null -s --max-time 6 \
-      -w '%{http_code} %{time_starttransfer} %{speed_download}' \
+      -w '%{http_code} %{time_connect} %{time_starttransfer} %{speed_download}' \
       'https://speed.cloudflare.com/__down?bytes=3000000' 2>/dev/null || true)"
-    read -r code ttfb speed mbps score < <(python3 - "$out" <<'PY'
+    read -r code conn ttfb speed mbps score < <(python3 - "$out" <<'PY'
 import sys
 parts = sys.argv[1].split()
 try:
     code = int(parts[0]) if len(parts) > 0 else 0
-    ttfb = float(parts[1]) if len(parts) > 1 else 9.0
-    speed = float(parts[2]) if len(parts) > 2 else 0.0
+    conn = float(parts[1]) if len(parts) > 1 else 9.0
+    ttfb = float(parts[2]) if len(parts) > 2 else 9.0
+    speed = float(parts[3]) if len(parts) > 3 else 0.0
 except ValueError:
-    code, ttfb, speed = 0, 9.0, 0.0
-score = int(speed) if code == 200 and speed > 200000 else 0
-print(f"{code} {ttfb:.3f} {speed:.0f} {speed*8/1e6:.2f} {score}")
+    code, conn, ttfb, speed = 0, 9.0, 9.0, 0.0
+# Rank by throughput weighted by low TCP RTT (favors nearby colos like NRT/HKG over distant ones)
+score = int(speed / max(conn, 0.05)) if code == 200 and speed > 200000 else 0
+print(f"{code} {conn:.3f} {ttfb:.3f} {speed:.0f} {speed*8/1e6:.2f} {score}")
 PY
 )
-    printf '  %-16s HTTP=%-3s ttfb=%ss speed=%s Mbps\n' "$ip" "$code" "$ttfb" "$mbps" >&2
-    if [[ "$score" -gt "$best_score" ]]; then
-      best_score="$score"
-      best_ip="$ip"
+    printf '  %-16s colo=%-4s HTTP=%-3s tcp=%ss ttfb=%ss speed=%s Mbps\n' "$ip" "$colo" "$code" "$conn" "$ttfb" "$mbps" >&2
+    if [[ "$score" -gt 0 ]]; then
+      results+="${score} ${ip}"$'\n'
     fi
   done
-  if [[ -z "$best_ip" ]]; then
-    best_ip="${CF_CANDIDATES[0]}"
-    printf 'Warning: benchmark inconclusive; defaulting to %s\n' "$best_ip" >&2
+
+  if [[ -z "$results" ]]; then
+    printf 'Warning: benchmark inconclusive; defaulting to %s\n' "${CF_CANDIDATES[0]}" >&2
+    printf '%s\n' "${CF_CANDIDATES[0]}"
+    return 0
   fi
-  printf '%s\n' "$best_ip"
+
+  printf '%s' "$results" | sort -rn | head -n "$top_n" | awk '{print $2}' | paste -sd ',' -
 }
 
 cmd_diagnose() {
@@ -381,133 +397,128 @@ install_local_singbox() {
 
 write_client_config() {
   local wifi_dev="$1"
-  local cf_ip="$2"
+  local cf_ips_csv="$2"
   local split_cn="$3"
-  local cn_rules=""
-  if [[ "$split_cn" -eq 1 ]]; then
-    cn_rules='      {
-        "domain_suffix": [
-          "cn", "local", "ts.net",
-          "qq.com", "wechat.com", "weixin.com",
-          "alipay.com", "alipayobjects.com",
-          "taobao.com", "tmall.com", "alicdn.com", "aliyun.com", "aliyuncs.com",
-          "jd.com", "baidu.com", "bdstatic.com",
-          "bilibili.com", "hdslb.com", "zhihu.com",
-          "meituan.com", "dianping.com", "amap.com",
-          "126.com", "163.com", "douyin.com", "bytedance.com",
-          "xiaohongshu.com", "xhscdn.com", "dingtalk.com", "feishu.cn",
-          "ctrip.com", "trip.com", "12306.cn", "cmbchina.com", "icbc.com.cn"
-        ],
-        "outbound": "direct"
-      },'
-  fi
 
-  cat > "$CLIENT_CFG" <<JSON
-{
-  "log": {
-    "level": "warn",
-    "timestamp": true
-  },
-  "dns": {
-    "servers": [
-      {
-        "tag": "cn-dns",
-        "type": "udp",
-        "server": "223.5.5.5",
-        "detour": "direct"
-      }
-    ],
-    "final": "cn-dns"
-  },
-  "inbounds": [
-    {
-      "type": "mixed",
-      "tag": "mixed-in",
-      "listen": "${PROXY_HOST}",
-      "listen_port": ${PROXY_PORT}
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "urltest",
-      "tag": "auto-proxy",
-      "outbounds": [
-        "cf-proxy",
-        "ts-fallback"
-      ],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "1m",
-      "tolerance": 500,
-      "interrupt_exist_connections": false
-    },
-    {
-      "type": "vless",
-      "tag": "cf-proxy",
-      "server": "${cf_ip}",
-      "server_port": 443,
-      "uuid": "${TRAVEL_VPN_UUID}",
-      "bind_interface": "${wifi_dev}",
-      "tls": {
-        "enabled": true,
-        "server_name": "${TRAVEL_VPN_HOST}",
-        "utls": {
-          "enabled": true,
-          "fingerprint": "chrome"
-        }
-      },
-      "transport": {
-        "type": "ws",
-        "path": "${TRAVEL_VPN_WSPATH}",
-        "headers": {
-          "Host": "${TRAVEL_VPN_HOST}"
+  python3 - "$CLIENT_CFG" "$wifi_dev" "$cf_ips_csv" "$split_cn" "$PROXY_HOST" "$PROXY_PORT" "$TRAVEL_VPN_UUID" "$TRAVEL_VPN_HOST" "$TRAVEL_VPN_WSPATH" <<'PY'
+import json, os, sys
+
+cfg_path, wifi_dev, cf_ips_csv, split_cn, proxy_host, proxy_port, uuid, host, wspath = sys.argv[1:10]
+cf_ips = [ip.strip() for ip in cf_ips_csv.split(",") if ip.strip()]
+if not cf_ips:
+    cf_ips = ["108.162.198.50"]
+
+def make_cf_outbound(tag, ip):
+    return {
+        "type": "vless",
+        "tag": tag,
+        "server": ip,
+        "server_port": 443,
+        "uuid": uuid,
+        "bind_interface": wifi_dev,
+        "tls": {
+            "enabled": True,
+            "server_name": host,
+            "utls": {
+                "enabled": True,
+                "fingerprint": "chrome"
+            }
         },
-        "max_early_data": 2048,
-        "early_data_header_name": "Sec-WebSocket-Protocol"
-      },
-      "multiplex": {
-        "enabled": true,
-        "protocol": "h2mux",
-        "max_connections": 4,
-        "min_streams": 4
-      }
-    },
-    {
-      "type": "direct",
-      "tag": "ts-fallback"
-    },
-    {
-      "type": "direct",
-      "tag": "direct",
-      "bind_interface": "${wifi_dev}"
+        "transport": {
+            "type": "ws",
+            "path": wspath,
+            "headers": {
+                "Host": host
+            },
+            "max_early_data": 2048,
+            "early_data_header_name": "Sec-WebSocket-Protocol"
+        },
+        "multiplex": {
+            "enabled": True,
+            "protocol": "smux",
+            "max_connections": 8,
+            "min_streams": 2,
+            "max_streams": 8
+        }
     }
-  ],
-  "route": {
-    "default_domain_resolver": "cn-dns",
-    "rules": [
-      {
-        "ip_is_private": true,
-        "outbound": "direct"
-      },
-      {
-        "ip_cidr": [
-          "100.64.0.0/10"
-        ],
-        "outbound": "direct"
-      },
-${cn_rules}
-      {
+
+cf_tags = []
+cf_outbounds = []
+for idx, ip in enumerate(cf_ips, 1):
+    tag = f"cf-{idx}"
+    cf_tags.append(tag)
+    cf_outbounds.append(make_cf_outbound(tag, ip))
+
+rules = []
+if int(split_cn) == 1:
+    rules.append({
         "domain_suffix": [
-          "local",
-          "ts.net"
+            "cn", "local", "ts.net",
+            "qq.com", "wechat.com", "weixin.com",
+            "alipay.com", "alipayobjects.com",
+            "taobao.com", "tmall.com", "alicdn.com", "aliyun.com", "aliyuncs.com",
+            "jd.com", "baidu.com", "bdstatic.com",
+            "bilibili.com", "hdslb.com", "zhihu.com",
+            "meituan.com", "dianping.com", "amap.com",
+            "126.com", "163.com", "douyin.com", "bytedance.com",
+            "xiaohongshu.com", "xhscdn.com", "dingtalk.com", "feishu.cn",
+            "ctrip.com", "trip.com", "12306.cn", "cmbchina.com", "icbc.com.cn"
         ],
         "outbound": "direct"
-      }
+    })
+else:
+    rules.append({
+        "domain_suffix": ["local", "ts.net"],
+        "outbound": "direct"
+    })
+
+rules.extend([
+    {"ip_is_private": True, "outbound": "direct"},
+    {"ip_cidr": ["100.64.0.0/10"], "outbound": "direct"}
+])
+
+cfg = {
+    "log": {"level": "warn", "timestamp": True},
+    "dns": {
+        "servers": [{
+            "tag": "cn-dns",
+            "type": "udp",
+            "server": "223.5.5.5",
+            "detour": "direct"
+        }],
+        "strategy": "ipv4_only",
+        "final": "cn-dns"
+    },
+    "inbounds": [{
+        "type": "mixed",
+        "tag": "mixed-in",
+        "listen": proxy_host,
+        "listen_port": int(proxy_port)
+    }],
+    "outbounds": [
+        {
+            "type": "urltest",
+            "tag": "auto-proxy",
+            "outbounds": cf_tags,
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": "1m",
+            "tolerance": 60,
+            "interrupt_exist_connections": False
+        },
+        *cf_outbounds,
+        {"type": "direct", "tag": "direct", "bind_interface": wifi_dev}
     ],
-    "final": "auto-proxy"
-  }
+    "route": {
+        "default_domain_resolver": "cn-dns",
+        "rules": rules,
+        "final": "auto-proxy"
+    }
 }
-JSON
-  chmod 600 "$CLIENT_CFG"
+
+with open(cfg_path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+os.chmod(cfg_path, 0o600)
+PY
   "$SINGBOX_BIN" check -c "$CLIENT_CFG"
 }
 
@@ -533,17 +544,21 @@ cmd_setup_client() {
   wifi_dev="$(detect_wifi_dev)"
   install_local_singbox "$wifi_dev"
 
+  local cf_ips
   if [[ "$cf_ip" == "auto" ]]; then
-    cf_ip="$(cmd_bench_cf)"
+    cf_ips="$(cmd_bench_cf --top 5)"
+    cf_ip="${cf_ips%%,*}"
+  else
+    cf_ips="$cf_ip"
   fi
 
-  # Persist chosen CF IP in creds.env
-  grep -v '^TRAVEL_VPN_CF_IP=' "$CREDS_FILE" > "${CREDS_FILE}.tmp" || true
-  printf 'TRAVEL_VPN_CF_IP=%s\n' "$cf_ip" >> "${CREDS_FILE}.tmp"
+  # Persist chosen CF IP(s) in creds.env
+  grep -vE '^TRAVEL_VPN_CF_IPS?=' "$CREDS_FILE" > "${CREDS_FILE}.tmp" || true
+  printf 'TRAVEL_VPN_CF_IP=%s\nTRAVEL_VPN_CF_IPS=%s\n' "$cf_ip" "$cf_ips" >> "${CREDS_FILE}.tmp"
   mv "${CREDS_FILE}.tmp" "$CREDS_FILE"
   chmod 600 "$CREDS_FILE"
 
-  write_client_config "$wifi_dev" "$cf_ip" "$split_cn"
+  write_client_config "$wifi_dev" "$cf_ips" "$split_cn"
 
   mkdir -p "$HOME/Library/LaunchAgents"
   cat > "$CLIENT_PLIST" <<PLIST
@@ -647,6 +662,14 @@ cmd_status() {
   pgrep -fl "sing-box run -c $CLIENT_CFG" || echo "not running"
   echo "=== Active macOS Proxy (scutil --proxy) ==="
   scutil --proxy | grep -E "HTTPEnable|HTTPProxy|HTTPPort|HTTPSEnable|SOCKSEnable" || true
+  if command -v tailscale >/dev/null 2>&1; then
+    local ts_exit
+    ts_exit="$(tailscale debug prefs 2>/dev/null | awk -F'"' '/"ExitNodeID"/{print $4; exit}' || true)"
+    if [[ -n "$ts_exit" ]]; then
+      echo "WARNING: Tailscale exit node is active ($ts_exit) — system DNS & non-proxy apps will crawl over DERP."
+      echo "         Recommended: tailscale set --exit-node= (keeps Tailscale connected for SSH/Taildrop)."
+    fi
+  fi
   echo "=== Exit IP & Latency ==="
   curl -x "http://${PROXY_HOST}:${PROXY_PORT}" -s --max-time 8 https://ipinfo.io/json | grep -E '"ip"|"city"|"region"|"country"' || echo "proxy unreachable"
   curl -x "http://${PROXY_HOST}:${PROXY_PORT}" -o /dev/null -s --max-time 8 -w "google.com: HTTP %{http_code} in %{time_starttransfer}s\n" https://www.google.com || true
@@ -711,7 +734,7 @@ cmd_share_peer() {
   [[ -f "$CREDS_FILE" ]] || die "missing $CREDS_FILE — run setup-server and setup-client first"
   # shellcheck disable=SC1090
   source "$CREDS_FILE"
-  local cf_ip="${TRAVEL_VPN_CF_IP:-${CF_CANDIDATES[0]}}"
+  local cf_ips="${TRAVEL_VPN_CF_IPS:-${TRAVEL_VPN_CF_IP:-108.162.198.50,108.162.198.1,162.159.136.42,172.64.155.209,104.19.45.10}}"
 
   cat > "$out_file" <<EOF
 #!/usr/bin/env bash
@@ -720,7 +743,7 @@ set -euo pipefail
 UUID="${TRAVEL_VPN_UUID}"
 WSPATH="${TRAVEL_VPN_WSPATH}"
 TUNNEL_HOST="${TRAVEL_VPN_HOST}"
-CF_IP="${cf_ip}"
+CF_IPS="${cf_ips}"
 SB_VER="${SINGBOX_VERSION}"
 PROXY_PORT="${PROXY_PORT}"
 
@@ -742,67 +765,59 @@ if [[ ! -x "\$HOME/bin/sing-box" ]]; then
   rm -rf /tmp/sb.tar.gz "/tmp/sing-box-\${SB_VER}-darwin-\${ARCH}"
 fi
 
-cat > "\$HOME/.travel-vpn/client.json" <<JSON
-{
-  "log": { "level": "warn", "timestamp": true },
-  "dns": {
-    "servers": [{ "tag": "cn-dns", "type": "udp", "server": "223.5.5.5", "detour": "direct" }],
-    "final": "cn-dns"
-  },
-  "inbounds": [{ "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": \${PROXY_PORT} }],
-  "outbounds": [
-    {
-      "type": "urltest",
-      "tag": "auto-proxy",
-      "outbounds": ["cf-proxy", "ts-fallback"],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "1m",
-      "tolerance": 500,
-      "interrupt_exist_connections": false
+python3 - "\$HOME/.travel-vpn/client.json" "\$WIFI_DEV" "\$CF_IPS" "\$PROXY_PORT" "\$UUID" "\$TUNNEL_HOST" "\$WSPATH" <<'PY'
+import json, os, sys
+cfg_path, wifi_dev, cf_ips_csv, port, uuid, host, wspath = sys.argv[1:8]
+ips = [x.strip() for x in cf_ips_csv.split(",") if x.strip()] or ["108.162.198.50"]
+tags, obs = [], []
+for i, ip in enumerate(ips, 1):
+    t = f"cf-{i}"
+    tags.append(t)
+    obs.append({
+        "type": "vless", "tag": t, "server": ip, "server_port": 443,
+        "uuid": uuid, "bind_interface": wifi_dev,
+        "tls": {"enabled": True, "server_name": host, "utls": {"enabled": True, "fingerprint": "chrome"}},
+        "transport": {
+            "type": "ws", "path": wspath, "headers": {"Host": host},
+            "max_early_data": 2048, "early_data_header_name": "Sec-WebSocket-Protocol"
+        },
+        "multiplex": {"enabled": True, "protocol": "smux", "max_connections": 8, "min_streams": 2, "max_streams": 8}
+    })
+cfg = {
+    "log": {"level": "warn", "timestamp": True},
+    "dns": {
+        "servers": [{"tag": "cn-dns", "type": "udp", "server": "223.5.5.5", "detour": "direct"}],
+        "strategy": "ipv4_only", "final": "cn-dns"
     },
-    {
-      "type": "vless",
-      "tag": "cf-proxy",
-      "server": "\${CF_IP}",
-      "server_port": 443,
-      "uuid": "\${UUID}",
-      "bind_interface": "\${WIFI_DEV}",
-      "tls": { "enabled": true, "server_name": "\${TUNNEL_HOST}", "utls": { "enabled": true, "fingerprint": "chrome" } },
-      "transport": {
-        "type": "ws",
-        "path": "\${WSPATH}",
-        "headers": { "Host": "\${TUNNEL_HOST}" },
-        "max_early_data": 2048,
-        "early_data_header_name": "Sec-WebSocket-Protocol"
-      },
-      "multiplex": { "enabled": true, "protocol": "h2mux", "max_connections": 4, "min_streams": 4 }
-    },
-    { "type": "direct", "tag": "ts-fallback" },
-    { "type": "direct", "tag": "direct", "bind_interface": "\${WIFI_DEV}" }
-  ],
-  "route": {
-    "default_domain_resolver": "cn-dns",
-    "rules": [
-      { "ip_is_private": true, "outbound": "direct" },
-      { "ip_cidr": ["100.64.0.0/10"], "outbound": "direct" },
-      {
-        "domain_suffix": [
-          "cn", "local", "ts.net", "qq.com", "wechat.com", "weixin.com",
-          "alipay.com", "alipayobjects.com", "taobao.com", "tmall.com", "alicdn.com",
-          "aliyun.com", "aliyuncs.com", "jd.com", "baidu.com", "bdstatic.com",
-          "bilibili.com", "hdslb.com", "zhihu.com", "meituan.com", "dianping.com",
-          "amap.com", "126.com", "163.com", "douyin.com", "bytedance.com",
-          "xiaohongshu.com", "xhscdn.com", "dingtalk.com", "feishu.cn",
-          "ctrip.com", "trip.com", "12306.cn", "cmbchina.com", "icbc.com.cn"
-        ],
-        "outbound": "direct"
-      }
+    "inbounds": [{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": int(port)}],
+    "outbounds": [
+        {"type": "urltest", "tag": "auto-proxy", "outbounds": tags,
+         "url": "https://www.gstatic.com/generate_204", "interval": "1m", "tolerance": 60, "interrupt_exist_connections": False},
+        *obs,
+        {"type": "direct", "tag": "direct", "bind_interface": wifi_dev}
     ],
-    "final": "auto-proxy"
-  }
+    "route": {
+        "default_domain_resolver": "cn-dns",
+        "rules": [
+            {"domain_suffix": [
+                "cn", "local", "ts.net", "qq.com", "wechat.com", "weixin.com",
+                "alipay.com", "alipayobjects.com", "taobao.com", "tmall.com", "alicdn.com",
+                "aliyun.com", "aliyuncs.com", "jd.com", "baidu.com", "bdstatic.com",
+                "bilibili.com", "hdslb.com", "zhihu.com", "meituan.com", "dianping.com",
+                "amap.com", "126.com", "163.com", "douyin.com", "bytedance.com",
+                "xiaohongshu.com", "xhscdn.com", "dingtalk.com", "feishu.cn",
+                "ctrip.com", "trip.com", "12306.cn", "cmbchina.com", "icbc.com.cn"
+            ], "outbound": "direct"},
+            {"ip_is_private": True, "outbound": "direct"},
+            {"ip_cidr": ["100.64.0.0/10"], "outbound": "direct"}
+        ],
+        "final": "auto-proxy"
+    }
 }
-JSON
-chmod 600 "\$HOME/.travel-vpn/client.json"
+with open(cfg_path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, indent=2)
+os.chmod(cfg_path, 0o600)
+PY
 "\$HOME/bin/sing-box" check -c "\$HOME/.travel-vpn/client.json"
 
 cat > "\$HOME/Library/LaunchAgents/ai.local.travel-vpn-client.plist" <<PLIST
