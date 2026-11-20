@@ -92,6 +92,13 @@ If browsing or downloads feel slow while `travel-vpn` is running:
 3. **Re-benchmark Cloudflare edge IPs (`scripts/travel-vpn bench-cf --top 5`)**: On China Unicom/Telecom, `108.162.198.x` (Tokyo `NRT`, ~93 ms) often sits directly on the great-circle path to US West exit hosts and avoids Singapore (`SIN`) detours.
 4. **If you need <150 ms latency or 50–150+ Mbps**: An exit host in California has a physical ~500 ms TTFB floor from China; deploy `sing-box` (`VLESS + Reality` or `Hysteria2`) on a closer HK/Tokyo/LA CN2 GIA VPS instead.
 
+## Field pitfalls (verified)
+
+- **Never stop the client from the machine that is using it.** Applying `setup-client` sets `http_proxy=127.0.0.1:7890` for the whole shell/app environment; anything that stops or replaces the client before the replacement is listening severs the agent's own API traffic (`proxyconnect tcp: dial tcp 127.0.0.1:7890: connect: connection refused`). Bring the new client up before retiring the old one, or do the cutover from a shell outside the proxied process.
+- **A rotated Quick Tunnel silently degrades to `ts-fallback`.** Any `cloudflared` restart on the exit host issues a new `trycloudflare.com` hostname. The pinned client then gets Cloudflare **530** at the edge, every `cf-*` outbound times out (`i/o timeout`), and `urltest` falls back to a Tailscale exit node (~1.4 Mbps) instead of erroring loudly. Diagnose with `curl --resolve "<host>:443:<cf-ip>" https://<host>/` — `530` = tunnel gone, `404` = tunnel healthy (the VLESS path is not a web route). Fix with `refresh`; if the exit host still runs the legacy `~/.fastvpn` layout, `refresh` cannot find `~/.travel-vpn/tunnel.err.log` and you must re-run `setup-server` (fresh UUID/path/tunnel) instead.
+- **The ceiling is the exit host's upload, not the client's downlink.** Measure both before promising numbers: relay download ≈ exit-host upload. A host with 7.4 MB/s down / 2.1 MB/s up caps the tunnel at ~17 Mbps, and ~13–14 Mbps is normal at ~78% of that ceiling. Benchmark the exit host's uplink first; 25–30+ Mbps requires an exit host with ≥30 Mbps upload.
+- **`creds.env` is sourced, so every value must survive `bash` word-splitting.** `TRAVEL_VPN_REMOTE_SSH_CMD=pc-ssh exec host --` executes `exec` at source time. Quote `REMOTE_HOST` and `REMOTE_SSH_CMD` when writing the file.
+
 ## Safety rules
 
 - Never print, commit, or paste the generated UUID, WebSocket path, `creds.env`, `client.json`, `server.json`, or `install-peer.sh` into chat, logs, or git repositories.
